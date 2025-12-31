@@ -2,3 +2,4 @@
 Find calibration board pattern from an image and extract center points in the circle grids array.
 
 ![Screenshot](./test/1.png)
+![Screenshot](./test/2.png)

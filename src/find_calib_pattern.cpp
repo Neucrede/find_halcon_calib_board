@@ -6,7 +6,7 @@
 /*
 BSD 2-Clause License
 
-Copyright (c) 2018-Now, Neucrede <neucrede@sina.com> 
+Copyright (c) 2018, Neucrede <neucrede@sina.com>
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -37,6 +37,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vector>
 #include <list>
 #include <stdexcept>
+#include <memory>
+#include <time.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -62,7 +64,7 @@ static int FindNearestPoint(const std::vector<cv::Point_<Tp1>>& points,
 
 template <typename Tp1, typename Tp2>
 static int FindNearestPoint(const std::vector<cv::Point_<Tp1>>& points, 
-        const cv::Point_<Tp2>& pt0);
+        const cv::Point_<Tp2>& pt0, const std::vector<int>& exclusions = std::vector<int>());
 
 template <typename Tp1, typename Tp2>
 static int FindNearestPoint(const std::vector<cv::Point_<Tp1>>& points, 
@@ -77,13 +79,79 @@ static bool SortEllipsesAndCenterPoints(cv::Size patSize, const std::vector<cv::
     const std::vector<cv::RotatedRect>& ellipses, std::vector<cv::RotatedRect>& sortedEllipses,
     const std::vector<cv::Point_<Tp2>>& centerPoints, std::vector<cv::Point_<Tp2>>& sortedCenterPoints);
 
+static bool HierarchicalClustering(const std::vector<cv::Point2d> &points, const cv::Size &patternSz, 
+    std::vector<int> &patternPointIndices);
+
+static bool ScanlineClustering(const std::vector<cv::Point2d> &points, const cv::Size &patternSz, 
+    const cv::Size imageSize, double distThresh, std::vector<int> &patternPointIndices,
+    std::vector<cv::Point2d>* pCornerPoints = nullptr);
+
 static bool ExtractContoursHalconCalibBoard(const cv::Mat& imgGray, int thresh, int total,
         std::vector<std::vector<cv::Point>>& contours, std::vector<cv::Point>& outerContour,
         std::vector<cv::Point>& innerContour, std::vector<int>& blobIndicesFiltered,
         bool inverseThresh = false);
 
-static bool HierarchicalClustering(const std::vector<cv::Point2d> &points, const cv::Size &patternSz, 
-    std::vector<int> &patternPointIndices);
+
+
+bool FindCheckerPattern(const cv::Mat& img, std::vector<cv::Point2d>& sortedCorners,
+    cv::Size patSize, int thresh, bool inverseThresh, bool subPixel, const cv::Mat& mask)
+{
+    if (img.empty()) {
+        throw std::invalid_argument("img is empty.");
+    }
+
+    if ((patSize.width < 5) || (patSize.height < 5)) {
+        throw std::invalid_argument("Pattern size can't be smaller than 5x5.");
+    }
+
+    cv::Mat imgGray;
+    if (img.channels() != 1) {
+        cv::cvtColor(img, imgGray, cv::COLOR_BGR2GRAY);
+    }
+    else {
+        imgGray = img.clone();
+    }
+
+    if (!mask.empty()) {
+        if (mask.type() != CV_8UC1) {
+            throw std::invalid_argument("Bad mask data type. Must be CV_8UC1.");
+        }
+
+        imgGray = imgGray & mask;
+    }
+
+    cv::Mat imgMono;
+    if (thresh < 0) {
+        cv::threshold(imgGray, imgMono, -1, 255, 
+            (inverseThresh ? cv::THRESH_BINARY_INV : cv::THRESH_BINARY) + cv::THRESH_OTSU);
+    }
+    else {
+        cv::threshold(imgGray, imgMono, thresh, 255, 
+            inverseThresh ? cv::THRESH_BINARY_INV : cv::THRESH_BINARY);
+    }
+
+    std::vector<cv::Point2f> corners;   // single precision required by cornerSubPix().
+    bool found = cv::findChessboardCorners(imgMono, patSize, corners, 0);
+    if (!found) {
+        return false;
+    }
+
+    if (subPixel) {
+        cv::cornerSubPix(imgGray, corners, cv::Size(7, 7), cv::Size(3, 3), 
+            cv::TermCriteria(CV_TERMCRIT_EPS | CV_TERMCRIT_ITER, 100, 0.01));
+    }
+
+    const int rows = patSize.height, cols = patSize.width;
+    sortedCorners.clear();
+    sortedCorners.reserve(rows * cols);
+    for (int r = rows - 1; r >= 0; --r) {
+        for (int c = 0; c < cols; ++c) {
+            sortedCorners.push_back(cv::Point2d(corners[r * cols + c]));
+        }
+    }
+    
+    return true;
+}
 
 bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sortedCenterPoints,
         cv::Size patSize, int thresh, bool inverseThresh, bool subPixel, const cv::Mat& mask,
@@ -93,11 +161,10 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
         throw std::invalid_argument("img is empty.");
     }
 
-    if ((patSize.width < 2) || (patSize.height < 2)) {
-        throw std::invalid_argument("Pattern size can't be smaller than 2x2.");
+    if ((patSize.width < 5) || (patSize.height < 5)) {
+        throw std::invalid_argument("Pattern size can't be smaller than 5x5.");
     }
 
-    // Convert to grayscale image.
     cv::Mat imgGray;
     if (img.channels() != 1) {
         cv::cvtColor(img, imgGray, cv::COLOR_BGR2GRAY);
@@ -106,7 +173,6 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
         imgGray = img.clone();
     }
 
-    // Filter then apply masking.
     cv::GaussianBlur(imgGray, imgGray, cv::Size(5, 5), 1.5);
     if (!mask.empty()) {
         if (mask.type() != CV_8UC1) {
@@ -116,7 +182,6 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
         imgGray = imgGray & mask;
     }
 
-    // Binarization.
     cv::Mat imgMono;
     if (thresh < 0) {
         cv::threshold(imgGray, imgMono, -1, 255, 
@@ -224,7 +289,12 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
     }
     
     const int numEllipses = ellipses.size();
+    if (numEllipses < total) {
+        return false;
+    }
 
+    std::vector<cv::Point2d> cornerPointsHintDup = cornerPointsHint;
+    
     // Find largest cluster of center points.
     std::vector<int> blobIndices;
     {
@@ -234,7 +304,10 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
             points.push_back(ellipse.center);
         }
 
-        if (!HierarchicalClustering(points, patSize, blobIndices)) {
+        // if (!HierarchicalClustering(points, patSize, blobIndices)) {
+        if (!ScanlineClustering(points, patSize, cv::Size(img.cols, img.rows), -1,
+            blobIndices, cornerPointsHintDup.size() < 4 ? &cornerPointsHintDup : nullptr)) 
+        {
             return false;
         }
     }
@@ -304,9 +377,9 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
     }
 
     // If 4 corner points are given in the order { origin, rear X, diagonal, rearY }.
-    if (cornerPointsHint.size() == 4) {
+    if (cornerPointsHintDup.size() == 4) {
         std::vector<cv::RotatedRect> _sortedEllipses;
-        if (!SortEllipsesAndCenterPoints(patSize, cornerPointsHint, ellipsesFiltered, _sortedEllipses,
+        if (!SortEllipsesAndCenterPoints(patSize, cornerPointsHintDup, ellipsesFiltered, _sortedEllipses,
             centerPoints, sortedCenterPoints)) 
         {
             return false;
@@ -348,8 +421,8 @@ bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sorted
 
     // Find bottom left corner.
     int idxBottomLeft = 0;
-    const cv::Point2d ptImageBottomLeft(0.0f, (double)(img.rows));
-    double minDist = 1.0e9f;
+    const cv::Point2d ptImageBottomLeft(0.0, (double)(img.rows));
+    double minDist = 1.0e9;
     for (int i = 0; i != 4; ++i) {
         int idx = cornerIndices[i];
         const cv::Point2d& pt = centerPoints[idx];
@@ -388,8 +461,8 @@ bool FindHalconCalibBoard(const cv::Mat& img, std::vector<cv::Point2d>& sortedCe
         throw std::invalid_argument("img is empty.");
     }
 
-    if ((patSize.width < 2) || (patSize.height < 2)) {
-        throw std::invalid_argument("Pattern size can't be smaller than 2x2.");
+    if ((patSize.width < 5) || (patSize.height < 5)) {
+        throw std::invalid_argument("Pattern size can't be smaller than 5x5.");
     }
 
     cv::Mat imgGray;
@@ -640,13 +713,26 @@ static int FindNearestPoint(const std::vector<cv::Point_<Tp1>>& points,
 
 template <typename Tp1, typename Tp2>
 static int FindNearestPoint(const std::vector<cv::Point_<Tp1>>& points, 
-        const cv::Point_<Tp2>& pt0)
+        const cv::Point_<Tp2>& pt0, const std::vector<int>& exclusions)
 {
     cv::Point_<Tp1> pt00 = pt0;
 
     int idx = -1;
     double minDist = 1.0e9f;
     for (int i = 0; i != points.size(); ++i) {
+        bool skip = false;
+        
+        for (int idx : exclusions) {
+            if (i == idx) {
+                skip = true;
+                break;
+            }
+        }
+        
+        if (skip) {
+            continue;
+        }
+        
         const cv::Point_<Tp1>& pt = points[i];
         double dist = std::hypot(pt.x - pt00.x, pt.y - pt00.y);
         if (dist < minDist) {
@@ -780,15 +866,14 @@ static bool SortEllipsesAndCenterPoints(cv::Size patSize, const std::vector<cv::
     return ((dist0N > (double)(N - 2) * dist01) && (dist0N < 1.2 * (double)(N - 1) * dist01));
 }
 
+// *** DEPRECATED ***
+// Use ScanlineClustering() instead.
+//
 static bool HierarchicalClustering(const std::vector<cv::Point2d> &points, const cv::Size &patternSz, 
     std::vector<int> &patternPointIndices)
 {
-    // This function was ported from OpenCV 3.4.5 calib3d module with modification.
-    //
-    // sources/modules/calib3d/src/circlesgrid.cpp  
-    // lines 70 - 138
-    //
-
+    assert(false && "deprecated");
+    
 /*M///////////////////////////////////////////////////////////////////////////////////////
  //
  //  IMPORTANT: READ BEFORE DOWNLOADING, COPYING, INSTALLING OR USING.
@@ -893,13 +978,580 @@ static bool HierarchicalClustering(const std::vector<cv::Point2d> &points, const
         return false;
     }
 
-    for(std::list<size_t>::iterator it = clusters[patternClusterIdx].begin(); it != clusters[patternClusterIdx].end();++it)
+    for(std::list<size_t>::iterator it = clusters[patternClusterIdx].begin(); 
+        it != clusters[patternClusterIdx].end(); ++it)
     {
         patternPointIndices.push_back(*it);
     }
 
     return true;
 }
+
+/* *****************************************************************************/
+
+#undef __DEBUG_SCANLINE_CLUSTERING__
+
+#if (defined(NDEBUG) || !defined(_WIN32))
+    #undef __DEBUG_SCANLINE_CLUSTERING__
+#endif
+
+#ifdef __DEBUG_SCANLINE_CLUSTERING__
+    #include <opencv2/highgui.hpp>
+#endif
+
+static bool ScanlineClustering(const std::vector<cv::Point2d> &points, const cv::Size &patternSz, 
+    const cv::Size imageSize, double distThresh, std::vector<int> &patternPointIndices,
+    std::vector<cv::Point2d>* pCornerPoints)
+{
+    const size_t N = points.size();
+    const int rows = patternSz.height, cols = patternSz.width;
+    const size_t M = rows * cols;
+    const int dimLo = std::min(rows, cols), dimHi = std::max(rows, cols);
+    
+    // Compute centre of mass of the random ordered point set.
+    double centreOfMass[2] = { 0, 0 };
+    for (const cv::Point2d& pt : points) {
+        centreOfMass[0] += pt.x;
+        centreOfMass[1] += pt.y;
+    }
+    centreOfMass[0] /= (double)(N);
+    centreOfMass[1] /= (double)(N);
+    
+    // Take the point nearest to centre of mass as origin. 
+    int idxOrigin = FindNearestPoint(points, cv::Point2d(centreOfMass[0], centreOfMass[1]));
+    const cv::Point2d ptOrigin = points[idxOrigin];
+    
+#ifdef __DEBUG_SCANLINE_CLUSTERING__
+    cv::Mat img(imageSize, CV_8UC3, cv::Scalar::all(0));
+    for (size_t i = 0; i != N; ++i) {
+        cv::drawMarker(img, cv::Point(points[i]), cv::Scalar(0, 255, 0));
+    }
+    cv::imshow("Image", img);
+    cv::waitKey(10);
+#endif
+    
+    // Sort points by their distance from ptOrigin, in ascending order.
+    std::vector<int> sortedPointIndices;        // index to `points`
+    sortedPointIndices.reserve(N - 1);
+    for (size_t i = 0; i != N; ++i) {
+        if (i != idxOrigin) {
+            sortedPointIndices.push_back(i);
+        }
+    }
+    std::sort(sortedPointIndices.begin(), sortedPointIndices.end(), 
+        [&points, ptOrigin] (int lhs, int rhs) -> bool {
+            return std::hypot(points[lhs].x - ptOrigin.x, points[lhs].y - ptOrigin.y)
+                   < std::hypot(points[rhs].x - ptOrigin.x, points[rhs].y - ptOrigin.y);
+        }
+    );
+    
+    // distThresh := 1/5 nearest distance.
+    if (distThresh < 0) {
+        distThresh = std::hypot(points[sortedPointIndices[0]].x - ptOrigin.x,
+            points[sortedPointIndices[0]].y - ptOrigin.y) / 5.0;
+    }
+    
+    // Compute histogram of the distance from other points to either of 4
+    // nearest points.
+    const size_t K = 4;
+    int distHist[K];
+    memset(distHist, 0, K * sizeof(int));
+    std::vector<std::vector<int>> hintIndices;      // index to `points`
+    hintIndices.resize(4);
+    for (size_t k = 0; k != K; ++k) {
+        cv::Point2d ptk = points[sortedPointIndices[k]];
+        for (size_t j = 0; j != N - 1; ++j) {
+            if (j == k) {
+                continue;
+            }
+            
+            double dist = PointLineDistance(points[sortedPointIndices[j]], ptOrigin, ptk);
+            if (dist < distThresh) {
+                ++distHist[k];
+                hintIndices[k].push_back(sortedPointIndices[j]);
+            }
+        }
+    }
+    
+    // Find a pair of points, where the angle between vectors
+    // (ptj - ptOrigin) and (ptk - ptOrigin) is closest to 90 degrees == pi/2 radians.
+    int bestPair[2] = {0, 1};   // index to `distHist` and `hintIndices`
+    double minAngleDiff = 1.0e99;   
+    for (size_t k = 0; k != K; ++k) {
+        cv::Point2d ptk = points[sortedPointIndices[k]];
+        for (size_t j = k + 1; j != K; ++j) {
+            cv::Point2d ptj = points[sortedPointIndices[j]];
+            
+            double angle_j = std::atan2(ptj.y - ptOrigin.y, ptj.x - ptOrigin.x);
+            double angle_k = std::atan2(ptk.y - ptOrigin.y, ptk.x - ptOrigin.x);
+            double angle = angle_j - angle_k;
+            
+            // Wrap angle value into range [0, pi].
+            int nWrap = angle / (2.0 * M_PI);
+            angle -= (double)(nWrap) * (2.0 * M_PI);
+            if (angle < 0) {
+                angle += M_PI;
+            }
+            
+            double angleDiff = std::abs(angle - 0.5 * M_PI);
+            if (angleDiff < minAngleDiff) {
+                minAngleDiff = angleDiff;
+                bestPair[0] = k;
+                bestPair[1] = j;
+            }
+        }
+    }
+
+    // Test if vector (points[bestPair[0]] - ptOrigin) is flatter than
+    // vector (points[bestPair[1]] - ptOrigin).
+    cv::Point2d pt0 = points[sortedPointIndices[bestPair[0]]], 
+                pt1 = points[sortedPointIndices[bestPair[1]]];
+    double angle0 = std::atan2(std::abs(pt0.y - ptOrigin.y), std::abs(pt0.x - ptOrigin.x));
+    double angle1 = std::atan2(std::abs(pt1.y - ptOrigin.y), std::abs(pt1.x - ptOrigin.x));
+    // swap them if not.
+    if (angle0 > angle1) {
+        std::swap(bestPair[0], bestPair[1]);
+    }
+    
+    // Horizontal axis-points sorted in ascending order by X coordinates.
+    std::vector<int>& horzAxispointIndices = hintIndices[bestPair[0]];
+    horzAxispointIndices.push_back(idxOrigin);
+    horzAxispointIndices.push_back(sortedPointIndices[bestPair[0]]);
+    std::sort(horzAxispointIndices.begin(), horzAxispointIndices.end(),
+        [&points](int lhs, int rhs) -> bool {
+            return points[lhs].x < points[rhs].x;
+        }
+    );
+    
+    // Vertical axis-points sorted in ascending order by Y coordinates.
+    std::vector<int>& vertAxispointIndices = hintIndices[bestPair[1]];
+    vertAxispointIndices.push_back(idxOrigin);
+    vertAxispointIndices.push_back(sortedPointIndices[bestPair[1]]);
+    std::sort(vertAxispointIndices.begin(), vertAxispointIndices.end(),
+        [&points](int lhs, int rhs) -> bool {
+            return points[lhs].y < points[rhs].y;
+        }
+    );
+    
+#ifdef __DEBUG_SCANLINE_CLUSTERING__
+    for (size_t i = 0; i != horzAxispointIndices.size(); ++i) {
+        cv::drawMarker(img, cv::Point(points[horzAxispointIndices[i]]), cv::Scalar(0, 255, 0),
+            cv::MARKER_STAR);
+        cv::drawMarker(img, cv::Point(points[horzAxispointIndices[i]]), cv::Scalar(0, 255, 0),
+            cv::MARKER_DIAMOND);
+        cv::imshow("Image", img);
+        cv::waitKey(10);
+    }
+    
+    for (size_t i = 0; i != vertAxispointIndices.size(); ++i) {
+        cv::drawMarker(img, cv::Point(points[vertAxispointIndices[i]]), cv::Scalar(0, 255, 0),
+            cv::MARKER_STAR);
+        cv::imshow("Image", img);
+        cv::waitKey(10);
+    }
+#endif
+    
+    // Number of vertical axis-points above horizontal axis. Note that the 
+    // positive Y axis always points downward in image coordinate system.
+    // Use int type for variable `nAboveHorzBaseline` to avoid error prone comparison to 
+    // unsigned values below.
+    int nAboveHorzBaseline = 0;     
+    for (size_t i = 0; i != vertAxispointIndices.size(); ++i) {
+        if (vertAxispointIndices[i] != idxOrigin) {
+            ++nAboveHorzBaseline;
+        }
+        else {
+            break;
+        }
+    }
+
+    // Scanlines jumping around horizontal axis. See figure below.
+    //
+    //                               +--- Order of scan
+    //                               |
+    //                               V
+    // **********+***********        n
+    //          ...                 ...
+    // **********+***********        5
+    // **********+***********        3
+    // **********+***********        1
+    // ++++++++++++++++++++++        0       <--- horizontal axis points
+    // **********+***********        2
+    // **********+***********        4
+    // **********+***********       ...
+    //          ...                 ...
+    // **********+***********       ...
+    //
+    std::vector<int> scanSeq;
+    scanSeq.reserve(vertAxispointIndices.size());
+    scanSeq.push_back(nAboveHorzBaseline);
+    for (int k = 1;; ++k) {
+        bool quit = true;
+        
+        // try move downward
+        if (nAboveHorzBaseline + k < vertAxispointIndices.size()) {
+            scanSeq.push_back(nAboveHorzBaseline + k);
+            quit = false;
+        }
+        
+        // try move upward
+        if (nAboveHorzBaseline - k >= 0) {
+            scanSeq.push_back(nAboveHorzBaseline - k);
+            quit = false;
+        }
+        
+        // quit if index out of bound
+        if (quit) {
+            break;
+        }
+    }
+    
+    // Index was used if true.
+    std::vector<bool> indexUsed;
+    indexUsed.resize(N, false);
+    for (int idx : horzAxispointIndices) {
+        indexUsed[idx] = true;
+    }
+    for (int idx : vertAxispointIndices) {
+        indexUsed[idx] = true;
+    }
+
+    
+    // Vector `scanlines` stores sorted point indices of each scanline.
+    std::vector<std::vector<int>> scanlines;
+    scanlines.reserve(dimHi);
+    scanlines.push_back(horzAxispointIndices);
+
+    // Process each scanline.
+    const size_t numScanlines = scanSeq.size();    
+    for (size_t s = 1; s != numScanlines; ++s) {
+        std::vector<int>& prevLine = scanlines[s - 1];
+        
+        int idxPrevBase = -1;      // `index to prevLine`
+        for (size_t i = 0; i != prevLine.size(); ++i) {
+            if (prevLine[i] == vertAxispointIndices[scanSeq[s - 1]]) {
+                idxPrevBase = i;
+                break;
+            }
+        }
+        
+        // Find from previous scanline the index of the point next to 
+        // the base point of previous scanline either to the left or right
+        // what so ever.
+        int idxNextToPrevBase = -1;   // index to `points`
+        if (idxPrevBase < 0) {
+            return false;
+        }
+        else if (idxPrevBase + 1 < prevLine.size()) {
+            idxNextToPrevBase = prevLine[idxPrevBase + 1];
+        }
+        else if (idxPrevBase - 1 >= 0) {
+            idxNextToPrevBase = prevLine[idxPrevBase - 1];
+        }
+        else {
+            return false;
+        }
+        
+        // Index of the basepoint of current scanline.
+        int idxCurBase = vertAxispointIndices[scanSeq[s]];
+        
+        cv::Point2d ptPrevBase = points[prevLine[idxPrevBase]];
+        cv::Point2d ptNextToPrevBase = points[idxNextToPrevBase];
+        cv::Point2d ptCurBase = points[idxCurBase];
+        
+        // Find second point for current scanline. See figure below.
+        //             
+        //                  
+        //                  
+        //        Current scanline L2 in parallel to L1          
+        //                        \
+        //                         \
+        // ptCurBase ---->  *................*  <--- ptSecond in search of
+        //                   \       *                  := Point closest to L2.
+        //                    \  * 
+        //                     \
+        //                      \
+        // ptPrevBase ------->   *-------------*   <---- ptNextToPrevBase     
+        //                               \
+        //                                \
+        //                               Previous scanline L1
+        //   
+        //
+        //
+        double lineParallel[2] = {
+            ptNextToPrevBase.x - ptPrevBase.x,
+            ptNextToPrevBase.y - ptPrevBase.y
+        };
+        double minDist = 1.0e99;
+        int idxNearest = -1;
+        for (size_t i = 0; i != N; ++i) {
+            if (indexUsed[i]) {
+                continue;
+            }
+            
+            cv::Point ptCur = points[i];
+            double x0 = ptCur.x - ptCurBase.x, y0 = ptCur.y - ptCurBase.y;
+
+            // Omitted dividing the cross product result by vector length of lineParallel,
+            // since the scaling is unimportant.
+            double dist = std::abs(x0 * lineParallel[1] - y0 * lineParallel[0]);
+            
+            if (dist < minDist) {
+                minDist = dist;
+                idxNearest = i;
+            }
+        }
+        
+        if (idxNearest < 0) {
+            return false;
+        }
+        
+        cv::Point2d ptSecond = points[idxNearest];
+        indexUsed[idxNearest] = true;
+        
+        // Find remaining points of current scanline.
+        std::vector<int> curLine;
+        curLine.reserve(dimHi);
+        curLine.push_back(idxCurBase);
+        curLine.push_back(idxNearest);
+        for (size_t i = 0; i != N; ++i) {
+            if (indexUsed[i]) {
+                continue;
+            }
+            
+            double dist = PointLineDistance(points[i], ptSecond, ptCurBase);
+            if (dist < distThresh) {
+                curLine.push_back(i);
+                indexUsed[i] = true;
+            }
+        }
+        
+        // Sort them in ascending order by X coords.
+        std::sort(curLine.begin(), curLine.end(),
+            [&points](int lhs, int rhs) -> bool {
+                return points[lhs].x < points[rhs].x;
+            }
+        );
+        
+#ifdef __DEBUG_SCANLINE_CLUSTERING__
+        for (size_t i = 0; i != curLine.size(); ++i) {
+            cv::drawMarker(img, cv::Point(points[curLine[i]]), cv::Scalar(0, 255, 0),
+                cv::MARKER_DIAMOND);
+            cv::imshow("Image", img);
+            cv::waitKey(10);
+        }
+#endif
+
+        // Check missing points or extreme perspective deform.
+        double maxDist = -1.0, minDist1 = 1.0e99, meanDist = 0.0;
+        for (size_t i = 1; i != curLine.size(); ++i) {
+            const cv::Point& ptPrev = points[curLine[i - 1]];
+            const cv::Point& ptCur = points[curLine[i]];
+            double dist = std::hypot(ptPrev.x - ptCur.x, ptPrev.y - ptCur.y);
+            if (dist > maxDist) {
+                maxDist = dist;
+            }
+            if (dist < minDist1) {
+                minDist1 = dist;
+            }
+            meanDist += dist;
+        }
+        meanDist /= (double)(curLine.size());
+        if ((maxDist > 1.5 * meanDist) || (minDist1 < 0.75 * meanDist)) {
+            return false;
+        }
+        
+        scanlines.push_back(std::move(curLine));
+    }
+    
+    // Sort in ascending order by Y coordinate.
+    std::vector<std::vector<int>> sortedScanlines;
+    sortedScanlines.resize(numScanlines);
+    for (size_t s = 0; s != numScanlines; ++s) {
+        sortedScanlines[scanSeq[s]].swap(scanlines[s]);
+    }
+    
+    // Find candidate scanlines.
+    //
+    // `scanlineBasepointIndices` stores index to `sortedScanlines`. 
+    // Positive `scanlineBasepointIndices` element if corresponding ordered-scanline is a candidate.
+    std::vector<int> scanlineBasepointIndices(numScanlines, -1); // --> sortedScanlines
+    // Used by next step.
+    // Number of points to the left of basepoint: 0, 2, 4, ...; 
+    // Nubmer of points to the right of basepoint: 1, 3, 5, ...; 
+    std::vector<int> scanlinePointsCount(2 * numScanlines, 0);
+    for (size_t s = 0; s != numScanlines; ++s) {
+        const std::vector<int>& curLine = sortedScanlines[s];
+        int& idxCurBase = scanlineBasepointIndices[s];
+        
+        if (curLine.size() < dimLo) {
+            continue;
+        }
+        
+        for (size_t j = 0; j != curLine.size(); ++j) {
+            if (vertAxispointIndices[s] == curLine[j]) {
+                idxCurBase = j;
+                break;
+            }
+        }
+        
+        size_t n = 1;
+        for (int j = 1; n <= dimHi; ++j) {
+            bool quit = true;
+            
+            // move toward positive direction along horizontal axis
+            if (idxCurBase + j < curLine.size()) {
+                ++scanlinePointsCount[2 * s + 1];
+                ++n;
+                quit = false;
+            }
+            
+            // move toward negative direction along horizontal axis
+            if (idxCurBase - j >= 0) {
+                ++scanlinePointsCount[2 * s];
+                ++n;
+                quit = false;
+            }
+            
+            // if index out of bound
+            if (quit) {
+                break;
+            }
+        }
+        
+        if (n < dimLo) {
+            idxCurBase = -1;
+        }
+    }
+
+    // Locate rect grid points centered at `ptOrigin`, as far as possible.
+    auto fScan = 
+        [&scanlinePointsCount, numScanlines] 
+        (int dimA, int dimB, int& idxFirstScanline, int& nLeft) -> bool
+    {
+        const int s0 = numScanlines / 2, ds = dimB / 2;
+        bool found = false;
+
+        for (int j = 0; true; ++j) {
+            int quit = 0;
+
+            for (int q = 0; q <= 1; ++q) {
+                int sj = (q == 0) ? s0 - ds - j : s0 - ds + j;
+                if ((sj >= 0) && (sj + dimB <= numScanlines)) {
+                    // both initialised as a BIGGGGggg number thanks to two's complement magic.
+                    size_t minNumLeft = -1, minNumRight = -1; 
+                    for (int k = sj; k < sj + dimB; ++k) {
+                        size_t n;
+
+                        n = scanlinePointsCount[2 * k];
+                        if (n < minNumLeft) {
+                            minNumLeft = n;
+                        }
+
+                        n = scanlinePointsCount[2 * k + 1];
+                        if (n < minNumRight) {
+                            minNumRight = n; 
+                        }
+                    }
+
+                    found = (1 + (int)(minNumLeft) + (int)(minNumRight) >= dimA);
+
+                    if (found) {
+                        idxFirstScanline = sj;
+                        nLeft = std::min((int)minNumLeft, (dimA - 1) / 2);
+                        if (dimA - 1 - nLeft > minNumRight) {
+                            nLeft = minNumLeft;
+                        }
+                        quit = 2;
+                    }
+                }
+                else {
+                    ++quit;
+                }
+
+                if (found || (/* dont't scan the same range twice */ j == 0)) {
+                    break;
+                }
+            }
+
+            if (quit >= 2) {
+                break;
+            }
+        }
+
+        return found;
+    };
+    
+    int idxFirstScanline = -1, numLeft = -1;
+    bool found1 = false, found2 = false;
+    found1 = fScan(cols, rows, idxFirstScanline, numLeft);
+    if (!found1) {
+        found2 = fScan(rows, cols, idxFirstScanline, numLeft);
+    }
+    if (!(found1 || found2)) {
+        return false;
+    }
+    
+    patternPointIndices.clear();
+    patternPointIndices.reserve(M);
+
+    const int s0 = found1 ? (idxFirstScanline + rows - 1) : (idxFirstScanline + cols - 1);
+    const int dim0 = found1 ? cols : rows;
+    for (int s = s0; s >= idxFirstScanline; --s) {
+        int idxCurBase = scanlineBasepointIndices[s];
+        std::vector<int>& curScanline = sortedScanlines[s];
+        for (int i = 0; i < dim0; ++i) {
+            patternPointIndices.push_back(curScanline[idxCurBase - numLeft + i]);
+        }
+    }
+    
+#ifdef __DEBUG_SCANLINE_CLUSTERING__
+        for (int i : patternPointIndices) {
+            cv::drawMarker(img, cv::Point(points[i]), cv::Scalar(0, 255, 0),
+                cv::MARKER_SQUARE);
+            cv::imshow("Image", img);
+            cv::waitKey(10);
+        }
+#endif
+
+    if (pCornerPoints) {
+        pCornerPoints->clear();
+        pCornerPoints->reserve(4);
+
+        if (found1) {
+            //
+            //   4------3   -
+            //   |      |   | rows
+            //   1------2   -
+            //
+            //   |------|
+            //     cols
+            //
+            pCornerPoints->push_back(points[patternPointIndices[0]]);
+            pCornerPoints->push_back(points[patternPointIndices[cols - 1]]);
+            pCornerPoints->push_back(points[patternPointIndices[rows * cols - 1]]);
+            pCornerPoints->push_back(points[patternPointIndices[(rows - 1) * cols]]);
+        }
+        else {
+            //
+            //   1------4  -
+            //   |      |  | cols
+            //   2------3  -
+            //
+            //   |------|
+            //     rows
+            //
+            pCornerPoints->push_back(points[patternPointIndices[(cols - 1) * rows]]);
+            pCornerPoints->push_back(points[patternPointIndices[0]]);
+            pCornerPoints->push_back(points[patternPointIndices[rows - 1]]);
+            pCornerPoints->push_back(points[patternPointIndices[rows * cols - 1]]);
+        }
+    }
+    
+    return true;
+}
+
+/* *****************************************************************************/
 
 static bool ExtractContoursHalconCalibBoard(const cv::Mat& imgGray, int thresh, int total,
         std::vector<std::vector<cv::Point>>& contours, std::vector<cv::Point>& outerContour,
@@ -1048,4 +1700,3 @@ static bool ExtractContoursHalconCalibBoard(const cv::Mat& imgGray, int thresh, 
 
     return (blobIndicesFiltered.size() == total);
 }
-

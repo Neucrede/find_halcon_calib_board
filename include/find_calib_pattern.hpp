@@ -14,6 +14,10 @@
 #include <vector>
 #include <opencv2/core.hpp>
 
+bool FindCheckerPattern(const cv::Mat& img, std::vector<cv::Point2d>& sortedCorners,
+    cv::Size patSize = cv::Size(7, 7), int thresh = -1, bool inverseThresh = false, 
+    bool subPixel = true, const cv::Mat& mask = cv::Mat());
+
 bool FindCirclesGridPattern(const cv::Mat& img, std::vector<cv::Point2d>& sortedCenterPoints,
         cv::Size patSize = cv::Size(7, 7), int thresh = -1, bool inverseThresh = false,
         bool subPixel = true, const cv::Mat& mask = cv::Mat(),

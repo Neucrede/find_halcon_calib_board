@@ -55,7 +55,7 @@ int LiveVideoTest(int argc, char* argv[])
 #endif
 
     std::vector<cv::Point2d> centers;
-    const cv::Size patSize(7, 7);
+    const cv::Size patSize(15, 15);
 
     std::cout << std::fixed << std::setprecision(3);
 
@@ -69,8 +69,8 @@ int LiveVideoTest(int argc, char* argv[])
         // std::cout << "\x1b[2J\x1b[1;1H" << std::endl;
         std::cout << "Frame #" << nFrame << "\n";
 
-        // if (FindCirclesGridPattern(frame, centers, patSize)) {
-        if (FindHalconCalibBoard(frame, centers, patSize)) {
+        if (FindCirclesGridPattern(frame, centers, patSize)) {
+        // if (FindHalconCalibBoard(frame, centers, patSize)) {
             ShowResults(frame, centers, patSize);
         }
         else {
